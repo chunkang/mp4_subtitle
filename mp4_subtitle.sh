@@ -5,6 +5,8 @@ Unlike its sibling mp4_silence_removal, this does no consolidation or silence
 removal: it takes one or more video sources as-is, transcribes each, and writes
 a subtitled copy next to the original. Accepts .mp4 / .mov / .avi (anything
 ffmpeg can read, really); the burned-in output is always .mp4.
+
+Author: Chun Kang <kurapa@kurapa.com>
 """
 
 from __future__ import annotations
