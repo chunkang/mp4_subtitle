@@ -11,6 +11,7 @@ Author: Chun Kang <kurapa@kurapa.com>
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -392,6 +393,23 @@ def prompt_volume_method() -> str:
         print("[mp4sub] please answer g or d")
 
 
+def prompt_recognize_boosted() -> bool:
+    """Ask whether to transcribe Demucs' isolated vocals instead of the original.
+
+    Only meaningful with Demucs: feeding Whisper the clean voice-only stem can
+    improve recognition over a noisy / music-laden mix. (Loudness alone would not
+    help -- Whisper normalises levels -- so this is offered only for Demucs.) It
+    runs the slow separation before transcription rather than only at burn time.
+    """
+    try:
+        answer = safe_input(
+            "transcribe from the isolated vocals too, for better recognition? [y/N]: "
+        )
+    except (UndecodableInput, EOFError):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def prompt_whisper_model(default: str) -> str:
     valid = {"tiny", "base", "small", "medium", "large-v3"}
     while True:
@@ -642,13 +660,13 @@ def _ensure_demucs() -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "demucs"])
 
 
-def boost_voice_demucs(source: Path, volume: float, workdir: Path) -> Path:
-    """Isolate the vocal stem with Demucs, amplify it, remix, return the wav.
+def demucs_separate(source: Path, workdir: Path) -> tuple[Path, Path]:
+    """Split source into (vocals, no_vocals) stems with Demucs. Returns paths.
 
-    Demucs (htdemucs, --two-stems) splits the audio into vocals + everything
-    else; we scale only the vocals and sum the stems back (amix normalize=0, so
-    levels are preserved rather than averaged). The result is the original mix
-    with just the voice turned up, even where it overlapped music or noise.
+    Demucs (htdemucs, --two-stems) separates the audio into the voice and
+    everything else. The isolated vocals double as both a clean track to feed
+    Whisper (better recognition than the original mix) and the stem we amplify
+    for the boosted burn -- so separation, the slow part, runs only once.
     """
     _ensure_demucs()
     audio = workdir / "audio.wav"
@@ -674,13 +692,18 @@ def boost_voice_demucs(source: Path, volume: float, workdir: Path) -> Path:
     vocals = next(iter(out.glob("**/vocals.mp3")), None)
     if vocals is None:
         raise RuntimeError("demucs produced no vocals stem")
-    no_vocals = vocals.with_name("no_vocals.mp3")
+    return vocals, vocals.with_name("no_vocals.mp3")
+
+
+def remix_boosted(vocals: Path, no_vocals: Path, volume: float, workdir: Path) -> Path:
+    """Scale the vocal stem, sum it back with the rest, peak-limit; return wav.
+
+    amix normalize=0 keeps the stems' levels instead of averaging them, then a
+    peak limiter catches the overshoot: at a high multiplier the boosted vocals
+    plus backing track would otherwise exceed full scale and hard-clip into
+    distortion, so the voice comes out loud but clean.
+    """
     mixed = workdir / "boosted.wav"
-    # Scale the vocal stem, sum it back with the rest (normalize=0 keeps levels
-    # instead of averaging), then run a peak limiter: at a high multiplier the
-    # boosted vocals + backing track would otherwise exceed full scale and
-    # hard-clip into distortion. alimiter catches those peaks so the voice comes
-    # out loud but clean.
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-i", str(vocals), "-i", str(no_vocals),
@@ -742,7 +765,8 @@ def burn_subtitles(source: Path, vtt: Path, output: Path, volume: float = 1.0,
 # ---------- driver ----------
 
 def subtitle_one(video: Path, model: "WhisperModel", out_base: Path | None = None,
-                 volume: float = 1.0, method: str = "none") -> None:
+                 volume: float = 1.0, method: str = "none",
+                 recognize_boosted: bool = False) -> None:
     # video is the file we transcribe and burn from; out_base decides where the
     # .vtt / .subtitled.mp4 land and what they are named. They differ when video
     # is a temp merged source but the outputs belong in the working directory.
@@ -758,57 +782,79 @@ def subtitle_one(video: Path, model: "WhisperModel", out_base: Path | None = Non
             answer = ""
         reuse_vtt = answer.strip().lower() != "n"
 
-    if reuse_vtt:
-        print(f"[mp4sub] reusing existing {vtt_path.name}")
-    else:
-        print(f"[mp4sub] detecting human voice (Silero VAD) in {video.name}")
-        voice = detect_voice(video, VAD_THRESHOLD)
-        if not voice:
-            print(f"[mp4sub] no human voice detected in {video.name}; skipping")
-            return
-        segments = transcribe(video, model)
-        # Keep the text but show each cue only over actual voice: widens coverage
-        # (quiet/secondary speakers survive) and keeps subtitles off the screen
-        # during silence.
-        segments, dropped = clip_cues_to_voice(segments, voice)
-        if dropped:
-            print(f"[mp4sub] dropped {dropped} cue(s) with no detected voice (noise/music)")
-        if not segments:
-            print(f"[mp4sub] no speech transcribed in {video.name}; skipping")
-            return
-        write_vtt(segments, vtt_path)
-        print(f"[mp4sub] wrote {vtt_path.name} ({len(segments)} cue(s))")
-
     boost = volume != 1.0 and method in ("gated", "demucs")
-    gain = "" if not boost else f" (voice volume x{volume:g}, {method})"
-    print(f"[mp4sub] burning subtitles{gain} -> {subtitled.name}")
 
-    burned = False
-    if boost and method == "demucs":
-        # Hold the temp dir (and stems) open across the burn that consumes them.
-        # If Demucs fails, don't throw away the (possibly very long) transcription:
-        # warn and fall through to gated gain instead.
-        try:
-            with tempfile.TemporaryDirectory(prefix="mp4sub_demucs_") as td:
-                processed = boost_voice_demucs(video, volume, Path(td))
+    with contextlib.ExitStack() as stack:
+        # With Demucs we separate the stems once and reuse them: the isolated
+        # vocals can feed Whisper (cleaner audio -> better recognition, when
+        # recognize_boosted) and are remixed for the boosted burn. The temp dir
+        # holding the stems stays open across both transcription and burn.
+        stems: tuple[Path, Path] | None = None
+        recog_video = video
+        td: Path | None = None
+        if boost and method == "demucs":
+            td = Path(stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="mp4sub_demucs_")))
+            if recognize_boosted and not reuse_vtt:
+                try:
+                    stems = demucs_separate(video, td)
+                    recog_video = stems[0]
+                    print("[mp4sub] recognizing speech from isolated vocals")
+                except Exception as e:
+                    print(f"[mp4sub] demucs separation failed ({e}); "
+                          f"recognizing from original audio, gated boost")
+                    method = "gated"
+
+        if reuse_vtt:
+            print(f"[mp4sub] reusing existing {vtt_path.name}")
+        else:
+            print(f"[mp4sub] detecting human voice (Silero VAD) in {recog_video.name}")
+            voice = detect_voice(recog_video, VAD_THRESHOLD)
+            if not voice:
+                print(f"[mp4sub] no human voice detected in {video.name}; skipping")
+                return
+            segments = transcribe(recog_video, model)
+            # Keep the text but show each cue only over actual voice: widens
+            # coverage (quiet/secondary speakers survive) and keeps subtitles off
+            # the screen during silence.
+            segments, dropped = clip_cues_to_voice(segments, voice)
+            if dropped:
+                print(f"[mp4sub] dropped {dropped} cue(s) with no detected voice (noise/music)")
+            if not segments:
+                print(f"[mp4sub] no speech transcribed in {video.name}; skipping")
+                return
+            write_vtt(segments, vtt_path)
+            print(f"[mp4sub] wrote {vtt_path.name} ({len(segments)} cue(s))")
+
+        gain = "" if not boost else f" (voice volume x{volume:g}, {method})"
+        print(f"[mp4sub] burning subtitles{gain} -> {subtitled.name}")
+
+        burned = False
+        if boost and method == "demucs":
+            # If Demucs fails, don't throw away the (possibly very long)
+            # transcription: warn and fall through to gated gain instead.
+            try:
+                if stems is None:
+                    stems = demucs_separate(video, td)
+                processed = remix_boosted(stems[0], stems[1], volume, td)
                 burn_subtitles(video, vtt_path, subtitled, audio_source=processed)
+                burned = True
+            except Exception as e:
+                print(f"[mp4sub] demucs voice boost failed ({e}); falling back to gated gain")
+                method = "gated"
+
+        if not burned and boost and method == "gated":
+            # Gate the gain to the speech ranges. The cues are already clipped to
+            # voice (clip_cues_to_voice), so reuse them: from the freshly built
+            # segments, or by parsing the vtt when reusing an existing one.
+            cue_ranges = ([(s, e) for s, e, _ in segments] if not reuse_vtt
+                          else read_vtt_ranges(vtt_path))
+            burn_subtitles(video, vtt_path, subtitled, volume=volume,
+                           gain_ranges=merge_ranges(cue_ranges))
             burned = True
-        except Exception as e:
-            print(f"[mp4sub] demucs voice boost failed ({e}); falling back to gated gain")
-            method = "gated"
 
-    if not burned and boost and method == "gated":
-        # Gate the gain to the speech ranges. The cues are already clipped to
-        # voice (clip_cues_to_voice), so reuse them: from the freshly built
-        # segments, or by parsing the vtt when reusing an existing one.
-        cue_ranges = ([(s, e) for s, e, _ in segments] if not reuse_vtt
-                      else read_vtt_ranges(vtt_path))
-        burn_subtitles(video, vtt_path, subtitled, volume=volume,
-                       gain_ranges=merge_ranges(cue_ranges))
-        burned = True
-
-    if not burned:
-        burn_subtitles(video, vtt_path, subtitled)
+        if not burned:
+            burn_subtitles(video, vtt_path, subtitled)
     print(f"[mp4sub] done: {subtitled}")
 
 
@@ -871,6 +917,9 @@ def main() -> None:
     voice_volume, voice_method = prompt_volume(float(settings.get("voice_volume", 1.0)))
     settings["voice_volume"] = voice_volume
     settings["voice_method"] = voice_method
+    # Transcribing the cleaned vocals only helps (and only runs the slow
+    # separation up front) when isolation is actually happening, i.e. Demucs.
+    recognize_boosted = voice_method == "demucs" and prompt_recognize_boosted()
     save_settings(settings)
 
     from faster_whisper import WhisperModel
@@ -885,10 +934,11 @@ def main() -> None:
             merged_src = Path(td) / "merged_source.mp4"
             concat_videos(usable, merged_src)
             subtitle_one(merged_src, model, Path.cwd() / MERGED_BASENAME,
-                         voice_volume, voice_method)
+                         voice_volume, voice_method, recognize_boosted)
     else:
         for v in usable:
-            subtitle_one(v, model, volume=voice_volume, method=voice_method)
+            subtitle_one(v, model, volume=voice_volume, method=voice_method,
+                         recognize_boosted=recognize_boosted)
 
 
 if __name__ == "__main__":

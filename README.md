@@ -108,6 +108,14 @@ change, e.g. `2` ≈ +6 dB) and pick a **method**:
   overlaps music or noise — but it downloads a model on first use and is slow on
   CPU. `demucs` is pip-installed into the venv the first time you choose it.
 
+When you pick Demucs, a follow-up prompt offers to **transcribe from the isolated
+vocals** as well. Whisper otherwise reads the original mixed audio; feeding it the
+clean voice-only stem can improve recognition over music or noise (loudness alone
+wouldn't — Whisper normalizes levels — so this is offered only for Demucs). The
+separation, the slow part, then runs once and is reused for both the transcript
+and the boosted burn. If Demucs fails at any point it falls back to gated gain and
+original-audio transcription, so a long run is never wasted.
+
 The output is always encoded as **H.264 video + AAC audio**, and carries only
 the burned-in text — any subtitle track in the source is dropped, since there's
 no need for a separate (soft) subtitle track on top of the rendered subtitles.
